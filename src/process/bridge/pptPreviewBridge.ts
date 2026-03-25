@@ -13,11 +13,11 @@
  */
 
 import { ipcBridge } from '@/common';
+import { getPlatformServices } from '@/common/platform';
 import { spawn, execSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
-import { app } from 'electron';
 import { getEnhancedEnv } from '@process/utils/shellEnv';
 
 interface WatchSession {
@@ -92,7 +92,7 @@ function killSession(filePath: string): void {
  * Background update check — runs at most once per day.
  */
 function checkForUpdate(): void {
-  const markerPath = path.join(app.getPath('userData'), '.officecli-update-check');
+  const markerPath = path.join(getPlatformServices().paths.getDataDir(), '.officecli-update-check');
   try {
     const stat = fs.statSync(markerPath);
     if (Date.now() - stat.mtimeMs < 24 * 60 * 60 * 1000) return; // checked within 24h
@@ -268,6 +268,19 @@ async function startWatch(filePath: string, retry = false): Promise<string> {
       settle(new Error(`officecli exited with ${reason}`));
     });
   });
+}
+
+/**
+ * Check if a port belongs to an active PPT preview session.
+ * Used by the web server proxy route to validate proxy targets.
+ */
+export function isActivePreviewPort(port: number): boolean {
+  for (const [, session] of sessions) {
+    if (session.port === port && !session.aborted && session.process.exitCode === null) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
