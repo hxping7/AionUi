@@ -59,15 +59,15 @@ repos:
         files: \.(ts|tsx|js|jsx)$
         pass_filenames: false
 
-  # Oxfmt (replaces Prettier — checks staged files only)
+  # Oxfmt (replaces Prettier — auto-fixes staged files only)
   - repo: local
     hooks:
       - id: oxfmt
         name: Oxfmt
-        entry: bun run format:check
+        entry: bun run format
         language: system
         files: \.(ts|tsx|js|jsx|json|css|md|yaml|yml|toml)$
-        pass_filenames: false
+        pass_filenames: true
 
   # i18n translation files validation
   - repo: local
@@ -76,7 +76,7 @@ repos:
         name: i18n Check
         entry: node scripts/check-i18n.js
         language: system
-        files: ^src/renderer/services/i18n/locales/
+        files: ^packages/desktop/src/renderer/services/i18n/locales/
         pass_filenames: false
 
   # Commit message format (Conventional Commits)

@@ -23,9 +23,19 @@ on:
         description: 'Only upload primary installers (exe/msi/dmg/deb), skip zip/yml/blockmap'
         type: boolean
         default: false
+      aioncore_run_id:
+        description: 'Optional AionCore Manual Build workflow run id to bundle instead of the pinned release'
+        type: string
+        default: ''
 
 env:
   BUN_INSTALL_REGISTRY: 'https://registry.npmjs.org/'
+  AIONUI_HUB_TAG: 'dist-ebc6a2b'
+  # Discontinued-build flag: only AionUi's final `-final` tag (e.g.
+  # v2.1.40-final) produces a build that guides users to the AionPro website.
+  # AionPro's own release tags never contain `-final`, so this stays 'false'
+  # there and in-app update behavior is untouched.
+  IS_DISCONTINUED_BUILD: ${{ contains(github.ref_name, '-final') && 'true' || 'false' }}
 
 jobs:
   code-quality:
@@ -50,7 +60,7 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --no-frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Run postinstall
         run: bun run postinstall || true
@@ -134,7 +144,7 @@ jobs:
           timeout_minutes: 10
           max_attempts: 3
           retry_wait_seconds: 30
-          command: bun install --no-frozen-lockfile
+          command: bun install --frozen-lockfile
 
       - name: Run postinstall
         run: bun run postinstall || true
@@ -192,6 +202,60 @@ jobs:
           echo "Commit: ${{ steps.commit.outputs.short }}"
           echo "=========================================="
 
+      - name: Resolve Sentry release name
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_NAME="${GITHUB_REF_NAME}"
+          elif [[ "$GITHUB_REF_NAME" == "dev" ]]; then
+            RELEASE_NAME="v${VERSION}-dev-${{ steps.commit.outputs.short }}"
+          else
+            RELEASE_NAME="v${VERSION}-${{ steps.commit.outputs.short }}"
+          fi
+
+          echo "SENTRY_RELEASE=$RELEASE_NAME" >> "$GITHUB_ENV"
+          echo "Sentry release: $RELEASE_NAME"
+
+      - name: Configure Sentry source map upload owner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ matrix.platform }}" == "linux-x64" ]]; then
+            echo "SENTRY_UPLOAD_SOURCE_MAPS=true" >> "$GITHUB_ENV"
+            echo "Sentry source maps will be uploaded by linux-x64"
+          else
+            echo "SENTRY_UPLOAD_SOURCE_MAPS=false" >> "$GITHUB_ENV"
+            echo "Sentry source map upload skipped for ${{ matrix.platform }}"
+          fi
+
+      - name: Validate Sentry source map upload configuration
+        if: matrix.platform == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+
+          for name in SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT SENTRY_RELEASE; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error title=Sentry configuration missing::$name is required for desktop source map uploads"
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "Sentry source map upload configured for $SENTRY_ORG/$SENTRY_PROJECT ($SENTRY_RELEASE)"
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+
       # macOS code signing certificate installation
       - name: Setup macOS code signing (macOS only)
         if: startsWith(matrix.platform, 'macos')
@@ -225,7 +289,7 @@ jobs:
           fi
 
       - name: Install Linux dependencies
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential python3 python3-pip pkg-config libsqlite3-dev fakeroot dpkg-dev rpm libnss3-dev libatk-bridge2.0-dev libdrm2 libxkbcommon-dev libxss1 libatspi2.0-dev libgtk-3-dev libxrandr2 libasound2-dev
@@ -303,6 +367,17 @@ jobs:
           MSVS_VERSION: 2022
           GYP_MSVS_VERSION: 2022
 
+      - name: Prepare aioncore binary
+        shell: bash
+        run: node scripts/prepareAioncore.js
+        env:
+          # Version is pinned in repo-root package.json (aioncoreVersion).
+          # Set AIONUI_BACKEND_VERSION here only to override for ad-hoc builds.
+          AIONUI_BACKEND_RUN_ID: ${{ inputs.aioncore_run_id }}
+          AIONUI_BACKEND_ARCH: ${{ matrix.arch }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build with electron-builder (Windows)
         if: startsWith(matrix.platform, 'windows')
         id: windows-build
@@ -329,6 +404,7 @@ jobs:
           }
         env:
           WINDOWS_BUILD_COMMAND: ${{ matrix.command }}
+          AIONUI_BACKEND_RUN_ID: ${{ inputs.aioncore_run_id }}
           # Node.js memory limit for vite bundling (prevents OOM during build)
           # Node.js 内存限制，防止 vite 打包时内存不足
           NODE_OPTIONS: '--max-old-space-size=8192'
@@ -363,6 +439,7 @@ jobs:
           # CI flag & GitHub token / CI 标识与 GitHub Token
           CI: true
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Clean up any stale disk images before DMG creation (macOS only)
       # 清理可能残留的磁盘镜像，避免 hdiutil "Device not configured" 错误
@@ -430,6 +507,7 @@ jobs:
           exit 1
         env:
           NODE_OPTIONS: '--max-old-space-size=8192'
+          AIONUI_BACKEND_RUN_ID: ${{ inputs.aioncore_run_id }}
           npm_config_arch: ${{ matrix.arch }}
           APP_ID: ${{ secrets.APP_ID }}
           appleId: ${{ secrets.APPLE_ID }}
@@ -453,11 +531,12 @@ jobs:
           SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
           CI: true
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Linux: Standard build without special error handling
       # Linux: 标准构建，无特殊错误处理
       - name: Build with electron-builder (Linux)
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 60
@@ -466,6 +545,7 @@ jobs:
           command: ${{ matrix.command }}
         env:
           NODE_OPTIONS: '--max-old-space-size=8192'
+          AIONUI_BACKEND_RUN_ID: ${{ inputs.aioncore_run_id }}
           npm_config_arch: ${{ matrix.arch }}
           npm_config_cache: ${{ runner.temp }}/.npm
           ELECTRON_CACHE: ${{ runner.temp }}/.cache/electron
@@ -482,12 +562,7 @@ jobs:
           SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
           CI: true
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
-      - name: Verify packaged bundled bun assets
-        if: >-
-          !startsWith(matrix.platform, 'windows') ||
-          steps.windows-build.outputs.result == 'success'
-        run: bun run test:packaged:bun
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # macOS 钥匙串清理
       - name: Clean up keychain (macOS only)
@@ -534,6 +609,29 @@ jobs:
             echo "No out directory found!"
           fi
 
+      # Verify desktop asar does not contain packages/web-cli/ contamination
+      # 验证桌面 asar 没有被 web-cli 代码污染
+      - name: Verify desktop asar isolation
+        if: >-
+          success() &&
+          (!startsWith(matrix.platform, 'windows') || steps.windows-build.outputs.result == 'success')
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASAR=$(find out -type f -name 'app.asar' -not -path '*node_modules*' | head -n 1 || true)
+          if [ -z "$ASAR" ]; then
+            echo "::notice::No app.asar found for ${{ matrix.platform }}, skipping isolation check"
+            exit 0
+          fi
+          echo "Inspecting $ASAR for web-cli leakage..."
+          LEAK_COUNT=$(bunx @electron/asar list "$ASAR" 2>/dev/null | grep -cE '^/packages/web-cli(/|$)' || true)
+          if [ "$LEAK_COUNT" != "0" ]; then
+            echo "::error::Desktop asar contains $LEAK_COUNT web-cli entries:"
+            bunx @electron/asar list "$ASAR" | grep -E '^/packages/web-cli(/|$)' | head -20
+            exit 1
+          fi
+          echo "✅ asar isolation verified: no packages/web-cli entries"
+
       # Upload artifacts when:
       # - Build succeeded (all platforms)
       # - macOS: notarization timeout but artifacts exist (handled in build step)
@@ -565,7 +663,6 @@ jobs:
             out/*.msi
             out/*.dmg
             out/*.deb
-            out/AionUi-*-win32-*.zip
             out/AionUi-*-mac-*.zip
             out/*.yml
           if-no-files-found: warn
